@@ -1,0 +1,789 @@
+#!/usr/bin/env python3
+"""
+Blind assistance: TFLite object detection on Raspberry Pi with Marathi audio (espeak).
+Run: python3 detect.py
+
+Auto-start on boot (example, adjust paths):
+  sudo nano /etc/systemd/system/blind-assist.service
+  ---
+  [Unit]
+  Description=Blind Assistance Detection
+  After=network.target sound.target
+
+  [Service]
+  Type=simple
+  User=pi
+  WorkingDirectory=/home/pi/OBJECT-DETECTION-PROJECT-main-main
+  ExecStart=/usr/bin/python3 /home/pi/OBJECT-DETECTION-PROJECT-main-main/detect.py
+  Restart=on-failure
+  RestartSec=5
+
+  [Install]
+  WantedBy=multi-user.target
+  ---
+  sudo systemctl enable blind-assist.service && sudo systemctl start blind-assist.service
+"""
+
+from __future__ import annotations
+
+import os
+import shutil
+import subprocess
+import sys
+import threading
+import time
+from collections import deque
+from queue import Empty, Queue
+from typing import Any, Dict, List, Optional, Tuple
+
+import o
+import cv2
+import numpy as np
+
+# ---------------------------------------------------------------------------
+# Configuration (tune for your camera / model)
+# ---------------------------------------------------------------------------
+MODEL_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "detect.tflite")
+_MODEL_CANDIDATES = ("detect.tflite", "model.tflite", "efficientdet_lite0.tflite")
+
+CONFIDENCE_THRESHOLD = 0.6
+FOCAL_SCALE = 0.45
+MIN_BBOX_PX = 8
+# Ignore very small objects (reduces noise; tune per resolution)
+MIN_BBOX_WIDTH_PX = 28
+
+COOLDOWN_SEC = 3.0
+DISTANCE_CHANGE_M = 0.6  # compared against smoothed distance
+
+CAMERA_INDEX = 0
+CAMERA_REOPEN_DELAY_SEC = 0.8
+FRAME_STRIDE_DEFAULT = 2
+# If FPS drops below this, process fewer frames (adaptive)
+FPS_TARGET_LOW = 6.0
+FPS_TARGET_HIGH = 12.0
+ADAPTIVE_STRIDE_MAX = 4
+# Re-evaluate stride only every N processed frames (avoids thrashing)
+ADAPTIVE_CHECK_INTERVAL = 45
+
+FPS_WINDOW = 30
+LOG_EVERY_FRAMES = 10
+
+# Rolling mean length for distance (reduces spoken jitter)
+DISTANCE_SMOOTH_LEN = 3
+
+# espeak
+_ESPEAK_CMDS = (("espeak-ng",), ("espeak",))
+
+# Priority: lower number = announce first (person > vehicles > others)
+PRIORITY_PERSON = 0
+PRIORITY_VEHICLE = 1
+PRIORITY_OTHER = 2
+
+VEHICLE_LABELS = frozenset(
+    {
+        "bicycle",
+        "car",
+        "motorcycle",
+        "airplane",
+        "bus",
+        "train",
+        "truck",
+        "boat",
+    }
+)
+
+# COCO 80 classes
+COCO_LABELS_EN: List[str] = [
+    "person",
+    "bicycle",
+    "car",
+    "motorcycle",
+    "airplane",
+    "bus",
+    "train",
+    "truck",
+    "boat",
+    "traffic light",
+    "fire hydrant",
+    "stop sign",
+    "parking meter",
+    "bench",
+    "bird",
+    "cat",
+    "dog",
+    "horse",
+    "sheep",
+    "cow",
+    "elephant",
+    "bear",
+    "zebra",
+    "giraffe",
+    "backpack",
+    "umbrella",
+    "handbag",
+    "tie",
+    "suitcase",
+    "frisbee",
+    "skis",
+    "snowboard",
+    "sports ball",
+    "kite",
+    "baseball bat",
+    "baseball glove",
+    "skateboard",
+    "surfboard",
+    "tennis racket",
+    "bottle",
+    "wine glass",
+    "cup",
+    "fork",
+    "knife",
+    "spoon",
+    "bowl",
+    "banana",
+    "apple",
+    "sandwich",
+    "orange",
+    "broccoli",
+    "carrot",
+    "hot dog",
+    "pizza",
+    "donut",
+    "cake",
+    "chair",
+    "couch",
+    "potted plant",
+    "bed",
+    "dining table",
+    "toilet",
+    "tv",
+    "laptop",
+    "mouse",
+    "remote",
+    "keyboard",
+    "cell phone",
+    "microwave",
+    "oven",
+    "toaster",
+    "sink",
+    "refrigerator",
+    "book",
+    "clock",
+    "vase",
+    "scissors",
+    "teddy bear",
+    "hair drier",
+    "toothbrush",
+]
+
+MARATHI_LABELS: Dict[str, str] = {
+    "person": "manus",
+    "bicycle": "saaiikal",
+    "car": "gaadi",
+    "motorcycle": "motarasaaiikal",
+    "bus": "bas",
+    "train": "train",
+    "truck": "trakk",
+    "boat": "naukaa",
+    "bird": "pakshi",
+    "cat": "maanjhar",
+    "dog": "kutra",
+    "bench": "baench",
+    "chair": "khurchi",
+    "bottle": "botal",
+    "cup": "kap",
+    "bowl": "vati",
+    "banana": "keli",
+    "apple": "safarchand",
+    "backpack": "phospaat",
+    "handbag": "haitthya baag",
+    "umbrella": "chhaataa",
+    "traffic light": "traaphik laait",
+    "stop sign": "thamba chinh",
+    "cell phone": "phon",
+    "laptop": "laipatop",
+    "tv": "tivi",
+    "clock": "ghadyaal",
+    "book": "pustak",
+    "couch": "sofaa",
+    "bed": "paaath",
+    "dining table": "jevanacha taak",
+    "toilet": "shauchagaq",
+    "sink": "sink",
+    "refrigerator": "phrij",
+    "microwave": "maikrovev",
+    "oven": "oven",
+    "toaster": "tostar",
+    "remote": "rimot",
+    "keyboard": "kiiborrd",
+    "mouse": "maus",
+    "scissors": "kaainchi",
+    "teddy bear": "teddi beaar",
+    "hair drier": "heiar draaiar",
+    "toothbrush": "daant burrsh",
+}
+
+
+def object_priority(label: str) -> int:
+    """person > vehicle > others"""
+    if label == "person":
+        return PRIORITY_PERSON
+    if label in VEHICLE_LABELS:
+        return PRIORITY_VEHICLE
+    return PRIORITY_OTHER
+
+
+def horizontal_zone(box: Tuple[int, int, int, int], frame_width: int) -> str:
+    """Split frame into LEFT / CENTER / RIGHT by bbox center."""
+    x1, _, x2, _ = box
+    cx = 0.5 * (x1 + x2)
+    third = frame_width / 3.0
+    if cx < third:
+        return "left"
+    if cx < 2.0 * third:
+        return "center"
+    return "right"
+
+
+def format_marathi_phrase(label_mr: str, distance_m: float, zone: str) -> str:
+    """Conversational Marathi with direction."""
+    d = round(distance_m, 1)
+    dist_part = f"andajane {d} meter antaravar"
+    if zone == "center":
+        return f"samor {label_mr} aahe, {dist_part}"
+    if zone == "left":
+        return f"davyabaju la {label_mr} aahe, {dist_part}"
+    return f"ujvyabaju la {label_mr} aahe, {dist_part}"
+
+
+def _resolve_model_path() -> str:
+    if os.path.isfile(MODEL_PATH):
+        return MODEL_PATH
+    base = os.path.dirname(os.path.abspath(__file__))
+    for name in _MODEL_CANDIDATES:
+        p = os.path.join(base, name)
+        if os.path.isfile(p):
+            return p
+    return MODEL_PATH
+
+
+def load_model(model_path: str) -> Tuple[Any, List[Dict[str, Any]], List[Dict[str, Any]]]:
+    """Load TFLite model and return interpreter + input/output detail dicts."""
+    try:
+        import tflite_runtime.interpreter as tflite
+    except ImportError:
+        try:
+            import tensorflow as tf  # type: ignore
+
+            tflite = tf.lite
+        except ImportError as exc:
+            raise RuntimeError(
+                "Need tflite-runtime (recommended on Pi) or tensorflow. "
+                "Install: pip install tflite-runtime"
+            ) from exc
+
+    if not os.path.isfile(model_path):
+        raise FileNotFoundError(f"Model not found: {model_path}")
+
+    interpreter = tflite.Interpreter(model_path=model_path, num_threads=2)
+    interpreter.allocate_tensors()
+    in_det = interpreter.get_input_details()
+    out_det = interpreter.get_output_details()
+    return interpreter, in_det, out_det
+
+
+def _class_name_from_id(class_id: int) -> str:
+    idx = int(class_id)
+    if 1 <= idx <= len(COCO_LABELS_EN):
+        return COCO_LABELS_EN[idx - 1]
+    if 0 <= idx < len(COCO_LABELS_EN):
+        return COCO_LABELS_EN[idx]
+    return f"object_{idx}"
+
+
+def _preprocess_for_input(
+    frame: np.ndarray,
+    in_shape: Tuple[int, ...],
+    in_dtype: np.dtype,
+) -> np.ndarray:
+    if len(in_shape) == 4:
+        _, h, w, _ = in_shape
+    else:
+        h, w = 300, 300
+
+    resized = cv2.resize(frame, (int(w), int(h)), interpolation=cv2.INTER_LINEAR)
+    rgb = cv2.cvtColor(resized, cv2.COLOR_BGR2RGB)
+    batch = np.expand_dims(rgb, axis=0)
+    if in_dtype == np.uint8:
+        return batch.astype(np.uint8)
+    if in_dtype in (np.float32, np.float64):
+        return (batch.astype(np.float32) / 255.0).astype(in_dtype)
+    return batch.astype(in_dtype)
+
+
+def _squeeze_leading(t: np.ndarray) -> np.ndarray:
+    x = np.squeeze(t)
+    if x.ndim == 2:
+        return np.expand_dims(x, axis=0)
+    return x
+
+
+def _parse_ssd_four_tensors(
+    out_tensors: List[np.ndarray],
+) -> Optional[Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]]:
+    if len(out_tensors) != 4:
+        return None
+
+    def is_boxes(t: np.ndarray) -> bool:
+        t = np.squeeze(t)
+        return t.ndim >= 2 and t.shape[-1] == 4
+
+    def is_num(t: np.ndarray) -> bool:
+        return int(np.array(t).size) == 1
+
+    a, b, c, d = out_tensors
+    if is_boxes(a) and is_num(d):
+        return a, b, c, d
+    if is_boxes(b) and is_num(a):
+        return b, c, d, a
+    if is_boxes(c) and is_num(d):
+        return c, a, b, d
+    return None
+
+
+def _parse_detection_outputs(
+    out_tensors: List[np.ndarray],
+    output_details: List[Dict[str, Any]],
+) -> Optional[Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]]:
+    parsed = _parse_ssd_four_tensors(out_tensors)
+    if parsed is not None:
+        return parsed
+
+    if len(out_tensors) != 4:
+        return None
+
+    boxes = classes = scores = num_det = None
+    for t in out_tensors:
+        ts = np.squeeze(t)
+        if ts.ndim >= 2 and ts.shape[-1] == 4:
+            boxes = t
+        elif ts.size == 1:
+            num_det = t
+    for t in out_tensors:
+        if t is boxes or t is num_det:
+            continue
+        ts = np.squeeze(t)
+        if ts.ndim >= 1 and ts.size > 1:
+            if t.dtype in (np.float32, np.float64, np.float16):
+                scores = t if scores is None else scores
+            else:
+                classes = t if classes is None else classes
+    if boxes is not None and scores is not None:
+        if classes is None:
+            classes = np.zeros_like(scores, dtype=np.float32)
+        if num_det is None:
+            sh = np.squeeze(scores).shape
+            n = int(sh[-1]) if len(sh) else 0
+            num_det = np.array([max(n, 1)], dtype=np.float32)
+        return boxes, classes, scores, num_det
+
+    try:
+        names = [od.get("name", "?") for od in output_details]
+        print("[WARN] Unrecognized TFLite outputs:", names, file=sys.stderr)
+    except Exception:
+        pass
+    return None
+
+
+def detect_objects(
+    interpreter: Any,
+    input_details: List[Dict[str, Any]],
+    output_details: List[Dict[str, Any]],
+    frame: np.ndarray,
+    conf_threshold: float,
+) -> List[Dict[str, Any]]:
+    """
+    Run inference; returns label, label_mr, score, box (pixel coords).
+    """
+    inp = input_details[0]
+    in_index = inp["index"]
+    in_shape = tuple(inp["shape"])
+    in_dtype = inp["dtype"]
+
+    tensor = _preprocess_for_input(frame, in_shape, in_dtype)
+    interpreter.set_tensor(in_index, tensor)
+    interpreter.invoke()
+
+    out_tensors = [interpreter.get_tensor(od["index"]) for od in output_details]
+    parsed = _parse_detection_outputs(out_tensors, output_details)
+
+    h_f, w_f = frame.shape[0], frame.shape[1]
+    ih = int(in_shape[1]) if len(in_shape) == 4 else h_f
+    iw = int(in_shape[2]) if len(in_shape) == 4 else w_f
+
+    detections: List[Dict[str, Any]] = []
+
+    if parsed is None:
+        return detections
+
+    boxes_t, classes_t, scores_t, num_t = parsed
+    boxes_arr = _squeeze_leading(boxes_t)
+    scores_arr = _squeeze_leading(scores_t) if scores_t is not None else None
+    classes_arr = _squeeze_leading(classes_t) if classes_t is not None else None
+
+    n_raw = int(np.ravel(num_t)[0]) if num_t is not None else boxes_arr.shape[1]
+    n = max(0, min(n_raw, boxes_arr.shape[1]))
+
+    for i in range(n):
+        row = boxes_arr[0, i].astype(np.float64)
+        if scores_arr is not None and scores_arr.size > i:
+            score = float(np.ravel(scores_arr)[i])
+        else:
+            score = 1.0
+        if score < conf_threshold:
+            continue
+
+        if row.max() <= 1.01:
+            ymin, xmin, ymax, xmax = float(row[0]), float(row[1]), float(row[2]), float(row[3])
+            x1 = int(xmin * w_f)
+            y1 = int(ymin * h_f)
+            x2 = int(xmax * w_f)
+            y2 = int(ymax * h_f)
+        else:
+            x1 = int(row[1] * w_f / max(iw, 1))
+            y1 = int(row[0] * h_f / max(ih, 1))
+            x2 = int(row[3] * w_f / max(iw, 1))
+            y2 = int(row[2] * h_f / max(ih, 1))
+
+        cls_id = 0
+        if classes_arr is not None and classes_arr.size > i:
+            cls_id = int(float(np.ravel(classes_arr)[i]))
+
+        label_en = _class_name_from_id(cls_id)
+        label_mr = MARATHI_LABELS.get(label_en, label_en.replace(" ", "_"))
+        detections.append(
+            {
+                "label": label_en,
+                "label_mr": label_mr,
+                "score": score,
+                "box": (x1, y1, x2, y2),
+            }
+        )
+
+    return _nms_filter(detections)
+
+
+def _iou(box_a: Tuple[int, int, int, int], box_b: Tuple[int, int, int, int]) -> float:
+    ax1, ay1, ax2, ay2 = box_a
+    bx1, by1, bx2, by2 = box_b
+    inter_w = max(0, min(ax2, bx2) - max(ax1, bx1))
+    inter_h = max(0, min(ay2, by2) - max(ay1, by1))
+    inter = inter_w * inter_h
+    if inter <= 0:
+        return 0.0
+    area_a = max(1, (ax2 - ax1) * (ay2 - ay1))
+    area_b = max(1, (bx2 - bx1) * (by2 - by1))
+    return inter / float(area_a + area_b - inter)
+
+
+def _nms_filter(dets: List[Dict[str, Any]], iou_thresh: float = 0.55) -> List[Dict[str, Any]]:
+    if len(dets) <= 1:
+        return dets
+    dets = sorted(dets, key=lambda x: -x["score"])
+    kept: List[Dict[str, Any]] = []
+    for cur in dets:
+        if all(_iou(cur["box"], k["box"]) < iou_thresh for k in kept):
+            kept.append(cur)
+    return kept
+
+
+def estimate_distance(
+    box: Tuple[int, int, int, int],
+    frame_width: int,
+    frame_height: int,
+    focal_scale: float = FOCAL_SCALE,
+) -> float:
+    x1, y1, x2, y2 = box
+    bw = max(float(x2 - x1), 1.0)
+    bh = max(float(y2 - y1), 1.0)
+    eff = max(bw, 0.5 * bh)
+    if eff < MIN_BBOX_PX:
+        return 99.0
+    d = (focal_scale * float(frame_width)) / eff
+    return max(0.2, min(float(d), 30.0))
+
+
+def smooth_distance(
+    history: Dict[Tuple[str, str], deque],
+    label: str,
+    zone: str,
+    raw_m: float,
+    maxlen: int = DISTANCE_SMOOTH_LEN,
+) -> float:
+    """Moving average over last frames for (label, zone) — reduces spoken jumps."""
+    key = (label, zone)
+    if key not in history:
+        history[key] = deque(maxlen=maxlen)
+    history[key].append(raw_m)
+    return float(sum(history[key])) / len(history[key])
+
+
+def prune_distance_history(
+    history: Dict[Tuple[str, str], deque],
+    active_keys: set,
+) -> None:
+    for k in list(history.keys()):
+        if k not in active_keys:
+            del history[k]
+
+
+def pick_primary_detection(dets: List[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+    """
+    Priority: person > vehicles > others; tie-break by nearest (smallest distance).
+    """
+    if not dets:
+        return None
+    return min(
+        dets,
+        key=lambda d: (object_priority(d["label"]), d.get("distance", 1e9)),
+    )
+
+
+# ---------------------------------------------------------------------------
+# Audio (Marathi via espeak / espeak-ng)
+# ---------------------------------------------------------------------------
+_tts_queue: Queue = Queue()
+_speak_thread_started = False
+
+
+def _find_espeak() -> Optional[List[str]]:
+    for cmd in _ESPEAK_CMDS:
+        binary = cmd[0]
+        if shutil.which(binary):
+            return [binary]
+    return None
+
+
+def _speak_worker(espeak_base: List[str]) -> None:
+    while True:
+        try:
+            text = _tts_queue.get(timeout=0.5)
+        except Empty:
+            continue
+        if text is None:
+            break
+        try:
+            args = espeak_base + ["-v", "mr", "-s", "130", text]
+            subprocess.run(args, check=False, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        except Exception as exc:
+            print("[SPEAK ERROR]", exc, file=sys.stderr)
+
+
+def speak(text: str) -> None:
+    if not text:
+        return
+    _tts_queue.put(text)
+
+
+def _ensure_speak_thread() -> None:
+    global _speak_thread_started
+    if _speak_thread_started:
+        return
+    exe = _find_espeak()
+    if not exe:
+        print("[WARN] espeak not found; install: sudo apt install espeak-ng", file=sys.stderr)
+        _speak_thread_started = True
+        return
+    threading.Thread(target=_speak_worker, args=(exe,), daemon=True).start()
+    _speak_thread_started = True
+
+
+def open_camera() -> Optional[cv2.VideoCapture]:
+    for idx in (CAMERA_INDEX, CAMERA_INDEX + 1):
+        cap = cv2.VideoCapture(idx)
+        if cap.isOpened():
+            cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
+            cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
+            cap.set(cv2.CAP_PROP_FPS, 30)
+            return cap
+    return None
+
+
+def main() -> None:
+    model_path = _resolve_model_path()
+    print("[INFO] Using model:", model_path)
+
+    try:
+        interpreter, input_details, output_details = load_model(model_path)
+    except FileNotFoundError as exc:
+        print("[FATAL] Model file missing:", exc, file=sys.stderr)
+        sys.exit(1)
+    except RuntimeError as exc:
+        print("[FATAL] TensorFlow Lite not available:", exc, file=sys.stderr)
+        sys.exit(1)
+    except Exception as exc:
+        print("[FATAL] Model load failed:", type(exc).__name__, exc, file=sys.stderr)
+        sys.exit(1)
+
+    _ensure_speak_thread()
+
+    cap = open_camera()
+    if cap is None:
+        print("[WARN] Camera not available at start; will retry in loop...", file=sys.stderr)
+
+    last_primary_key: Optional[Tuple[str, str]] = None
+    last_smooth_dist: Optional[float] = None
+    last_speak_time = 0.0
+    frame_idx = 0
+    times = deque(maxlen=FPS_WINDOW)
+    dist_history: Dict[Tuple[str, str], deque] = {}
+    frame_stride = FRAME_STRIDE_DEFAULT
+    processed_count = 0
+    consecutive_fail = 0
+
+    print("[INFO] Detection running (Ctrl+C to stop).")
+    print(
+        f"[INFO] conf>={CONFIDENCE_THRESHOLD}, min_bbox_w>={MIN_BBOX_WIDTH_PX}px, "
+        f"cooldown={COOLDOWN_SEC}s, stride={frame_stride} (adaptive)"
+    )
+
+    try:
+        while True:
+            t0 = time.perf_counter()
+
+            if cap is None or not cap.isOpened():
+                if cap is not None:
+                    cap.release()
+                    cap = None
+                print("[WARN] Camera disconnected or not opened — reconnecting...", flush=True)
+                time.sleep(CAMERA_REOPEN_DELAY_SEC)
+                cap = open_camera()
+                if cap is None:
+                    time.sleep(CAMERA_REOPEN_DELAY_SEC)
+                    continue
+
+            ret, frame = cap.read()
+            if not ret or frame is None:
+                consecutive_fail += 1
+                print(f"[WARN] Frame grab failed ({consecutive_fail}x); retrying...", flush=True)
+                if consecutive_fail >= 15:
+                    print("[WARN] Too many failures — releasing camera and reopening.", flush=True)
+                    cap.release()
+                    cap = None
+                    consecutive_fail = 0
+                time.sleep(0.15)
+                continue
+
+            consecutive_fail = 0
+            frame_idx += 1
+            if frame_idx % frame_stride != 0:
+                elapsed = time.perf_counter() - t0
+                times.append(elapsed)
+                continue
+
+            h, w = frame.shape[:2]
+            processed_count += 1
+            try:
+                dets = detect_objects(
+                    interpreter,
+                    input_details,
+                    output_details,
+                    frame,
+                    CONFIDENCE_THRESHOLD,
+                )
+            except Exception as exc:
+                print("[ERROR] Inference failed:", type(exc).__name__, exc, file=sys.stderr)
+                elapsed = time.perf_counter() - t0
+                times.append(elapsed)
+                continue
+
+            bw_min = max(MIN_BBOX_WIDTH_PX, w // 80)
+            dets = [
+                d
+                for d in dets
+                if (d["box"][2] - d["box"][0]) >= bw_min
+                and (d["box"][3] - d["box"][1]) >= MIN_BBOX_PX
+            ]
+
+            active_smooth_keys: set = set()
+            for d in dets:
+                z = horizontal_zone(d["box"], w)
+                d["zone"] = z
+                raw = estimate_distance(d["box"], w, h, FOCAL_SCALE)
+                d["distance_raw"] = raw
+                d["distance"] = smooth_distance(dist_history, d["label"], z, raw)
+                active_smooth_keys.add((d["label"], z))
+
+            prune_distance_history(dist_history, active_smooth_keys)
+
+            primary = pick_primary_detection(dets)
+            now = time.time()
+
+            if primary:
+                label = primary["label"]
+                zone = primary["zone"]
+                dist = float(primary["distance"])
+                pkey = (label, zone)
+
+                cooldown_ok = now - last_speak_time >= COOLDOWN_SEC
+                new_target = pkey != last_primary_key
+                moved = (
+                    last_smooth_dist is not None and abs(dist - last_smooth_dist) >= DISTANCE_CHANGE_M
+                )
+
+                if cooldown_ok and (new_target or moved):
+                    phrase = format_marathi_phrase(primary["label_mr"], dist, zone)
+                    speak(phrase)
+                    last_speak_time = now
+                    print("[SPEAK]", phrase, flush=True)
+
+                last_primary_key = pkey
+                last_smooth_dist = dist
+            else:
+                last_primary_key = None
+                last_smooth_dist = None
+
+            elapsed = time.perf_counter() - t0
+            times.append(elapsed)
+
+            fps = (len(times) / max(sum(times), 1e-9)) if times else 0.0
+            if processed_count % ADAPTIVE_CHECK_INTERVAL == 0 and times:
+                if fps < FPS_TARGET_LOW and frame_stride < ADAPTIVE_STRIDE_MAX:
+                    frame_stride += 1
+                    print(
+                        f"[INFO] Low FPS ({fps:.1f}) — increasing frame_stride to {frame_stride}",
+                        flush=True,
+                    )
+                elif fps > FPS_TARGET_HIGH and frame_stride > FRAME_STRIDE_DEFAULT:
+                    frame_stride -= 1
+                    print(
+                        f"[INFO] FPS recovered ({fps:.1f}) — decreasing frame_stride to {frame_stride}",
+                        flush=True,
+                    )
+
+            if frame_idx % LOG_EVERY_FRAMES == 0:
+                if primary:
+                    print(
+                        f"[det] object={primary['label']} | dist={primary['distance']:.2f}m "
+                        f"(raw~{primary['distance_raw']:.2f}m) | zone={primary['zone']} | "
+                        f"FPS={fps:.1f} | stride={frame_stride} | dets={len(dets)}",
+                        flush=True,
+                    )
+                else:
+                    print(
+                        f"[det] object=— | dist=— | zone=— | FPS={fps:.1f} | "
+                        f"stride={frame_stride} | dets={len(dets)}",
+                        flush=True,
+                    )
+
+    except KeyboardInterrupt:
+        print("\n[INFO] Stopped by user.")
+    finally:
+        if cap is not None:
+            cap.release()
+        _tts_queue.put(None)
+        time.sleep(0.3)
+
+
+if __name__ == "__main__":
+    main()
